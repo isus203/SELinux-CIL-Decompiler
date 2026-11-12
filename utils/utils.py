@@ -1,16 +1,45 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import os
-from enum import Enum
+import re
+from contextlib import contextmanager
+from enum import StrEnum
+from fnmatch import fnmatch
 from os import path
+from pathlib import Path
 from subprocess import PIPE, run
-from typing import List, Optional, Set
+from typing import Generator, List, Optional, Set
 
 script_dir = path.dirname(path.realpath(__file__))
-android_root = path.realpath(path.join(script_dir, '..', '..', '..', '..'))
+
+
+def _find_android_root() -> str:
+    # 1. Explicit override (terminal / CI)
+    for env_name in ('SEPOLICY_ANDROID_ROOT', 'ANDROID_BUILD_TOP'):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            return path.realpath(env_value)
+
+    # 2. First parent directory that contains system/sepolicy
+    #    (standalone checkout of this repository)
+    current = path.realpath(path.join(script_dir, '..'))
+    while True:
+        if path.isdir(path.join(current, 'system', 'sepolicy')):
+            return current
+
+        parent = path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    # 3. Original layout: <android_root>/lineage/scripts/dev/utils
+    return path.realpath(path.join(script_dir, '..', '..', '..', '..'))
+
+
+android_root = _find_android_root()
 
 
 def get_files_with_name(
@@ -40,11 +69,18 @@ def get_dirs_with_file(dir_path: str, name: str):
         yield path.dirname(file_path)
 
 
-def run_cmd(cmd: List[str]):
+def run_cmd(cmd: List[str], capture: bool = True):
+    if capture:
+        stdout = PIPE
+        stderr = PIPE
+    else:
+        stdout = None
+        stderr = None
+
     proc = run(
         cmd,
-        stdout=PIPE,
-        stderr=PIPE,
+        stdout=stdout,
+        stderr=stderr,
         text=True,
         check=False,
     )
@@ -57,7 +93,7 @@ def run_cmd(cmd: List[str]):
     return proc.stdout
 
 
-class Color(str, Enum):
+class Color(StrEnum):
     RED = '\033[0;31m'
     GREEN = '\033[0;32m'
     YELLOW = '\033[1;33m'
@@ -70,20 +106,84 @@ def color_print(*args: object, color: Color):
     print(args_str)
 
 
-def remove_comments(line: str):
-    index = line.find('#')
-    if index != -1:
-        line = line[:index]
+def read_texts(text_file_paths: List[Path]):
+    texts: List[str] = []
+    for text_file_path in text_file_paths:
+        text = text_file_path.read_text()
+        texts.append(text)
+        texts.append('\n')
+    return ''.join(texts)
 
-    return line
 
-
-def is_empty_line(line: str):
-    return not line.strip()
+SPACE_RE = re.compile(r'[ \t]+')
 
 
 def split_normalize_text(text: str):
-    lines = text.splitlines(keepends=True)
-    lines = list(map(remove_comments, lines))
-    lines = list(filter(lambda line: not is_empty_line(line), lines))
-    return lines
+    out: list[str] = []
+
+    for line in text.splitlines(keepends=True):
+        comment_index = line.find('#')
+
+        if comment_index != -1:
+            line = line[:comment_index]
+
+        line = SPACE_RE.sub(' ', line.lstrip())
+
+        if line.strip():
+            out.append(line)
+
+    return out
+
+@contextmanager
+def WorkingDirectory(dir_path: str) -> Generator[None, None, None]:
+    cwd = os.getcwd()
+
+    os.chdir(dir_path)
+
+    try:
+        yield
+    finally:
+        os.chdir(cwd)
+
+
+def resolve_paths(
+    dir_paths: List[Path],
+    names: Set[str],
+    recursive: bool,
+    paths_name: str,
+    verbose: bool,
+):
+    resolved_paths: List[Path] = []
+
+    def add_path(mp: Path):
+        if not mp.is_file():
+            return
+
+        for name in names:
+            if mp.name == name or fnmatch(mp.name, name):
+                break
+        else:
+            return
+
+        if verbose:
+            print(f'Loading {paths_name}: {mp}')
+
+        resolved_paths.append(mp)
+
+    for dir_path in dir_paths:
+        if dir_path.is_file():
+            add_path(dir_path)
+            continue
+
+        assert dir_path.is_dir(), f'{dir_path} is not a file or directory'
+
+        if recursive:
+            for root, _, files in dir_path.walk():
+                for file in files:
+                    file_path = root / file
+                    add_path(file_path)
+        else:
+            for file_path in dir_path.iterdir():
+                add_path(file_path)
+
+    return resolved_paths

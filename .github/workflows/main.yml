@@ -4,72 +4,87 @@ on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'URL репозитория с дампом прошивки'
+        description: 'URL репозитория с дампом прошивки (dumpyara/DumprX)'
         required: true
+      dump_branch:
+        description: 'Ветка дампа (пусто = ветка по умолчанию)'
+        required: false
+        default: ''
+      sepolicy_branch:
+        description: 'Ветка LineageOS/android_system_sepolicy'
+        required: false
+        default: 'lineage-23.2'
+      current:
+        description: 'Использовать текущие макросы (--current) вместо prebuilts/api'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  decompile:
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
-      - name: Install System Dependencies
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y m4 checkpolicy python3-pip
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison git-lfs
+          python -m pip install -r requirements.txt
 
-      - name: Clone Firmware Dump
+      - name: Cache checkpolicy/secilc
+        uses: actions/cache@v6
+        with:
+          path: out/host/linux-x86/bin
+          key: selinux-tools-3.9-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache system/sepolicy
+        uses: actions/cache@v6
+        with:
+          path: system/sepolicy
+          key: system-sepolicy-${{ inputs.sepolicy_branch }}
+
+      - name: Decompile
+        env:
+          PYTHON: python
+          REPO_URL: ${{ inputs.repo_url }}
+          DUMP_BRANCH: ${{ inputs.dump_branch }}
+          SEPOLICY_BRANCH: ${{ inputs.sepolicy_branch }}
+          USE_CURRENT: ${{ inputs.current }}
         run: |
-          echo "Клонирование дампа устройства..."
-          git clone --depth 1 ${{ github.event.inputs.repo_url }} firmware_dump
+          args=(-d "$REPO_URL" -o output -b "$SEPOLICY_BRANCH")
+          if [ -n "$DUMP_BRANCH" ]; then
+            args+=(--dump-branch "$DUMP_BRANCH")
+          fi
+          if [ "$USE_CURRENT" = "true" ]; then
+            args+=(--current)
+          fi
+          ./decompile.sh "${args[@]}"
 
-      - name: Collect SELinux Files & Decompile
+      - name: Summary
+        if: always()
         run: |
-          mkdir -p input_sepolicy
-          mkdir -p output_te
-          
-          echo "=== Поиск и сбор файлов SELinux из всех разделов ==="
-          
-          # Список стандартных мест и поиск по расширениям/именам (.cil, sepolicy, contexts)
-          # Ищем во всех ключевых директориях дампа (system, vendor, product, system_ext, odm)
-          find firmware_dump -type f \( -name "*.cil" -o -name "plat_sepolicy" -o -name "vendor_sepolicy" -o -name "precompiled_sepolicy" -o -name "*_contexts" \) | while read -r file; do
-            # Получаем относительный путь (например, system/etc/selinux/plat_sepolicy.cil)
-            rel_path=$(echo "$file" | sed 's|firmware_dump/||')
-            dir_name=$(dirname "$rel_path")
-            
-            # Воссоздаем структуру папок внутри input_sepolicy, чтобы скрипт понимал, откуда какой файл
-            mkdir -p "input_sepolicy/$dir_name"
-            cp "$file" "input_sepolicy/$dir_name/"
-            echo "Скопирован: $rel_path"
-          done
-
-          # Проверяем, нашлось ли хоть что-то
-          if [ -z "$(ls -A input_sepolicy)" ]; then
-            echo "::error::Файлы SELinux не найдены в дампе! Проверьте структуру разделов."
-            exit 1
+          if [ -d output ]; then
+            {
+              echo "### Decompiled SELinux policy"
+              echo '```'
+              find output -type f | sort | sed 's|^output/||'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          echo "=== Запуск декомпилятора ==="
-          # Поиск самого скрипта decompile_cil.py в текущем репозитории экшена
-          SCRIPT_PATH=$(find . -name "decompile_cil.py" | head -n 1)
-          if [ -z "$SCRIPT_PATH" ]; then
-            echo "::error::Скрипт decompile_cil.py не найден в репозитории экшена!"
-            exit 1
-          fi
-          
-          # Запуск декомпиляции из собранного со всех разделов слепка
-          python3 "$SCRIPT_PATH" -s input_sepolicy -o output_te
-
-      - name: Upload Decompiled Policy Artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload decompiled policy
+        uses: actions/upload-artifact@v7
         with:
-          name: decompiled_sepolicy_te
-          path: output_te/
-          
+          name: decompiled_sepolicy
+          path: output/
+          if-no-files-found: error
